@@ -1,0 +1,17 @@
+# Temporary: exercises the reusable workflow end to end against this repository.
+name: Self Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  release:
+    uses: fwullschleger/github-actions/.github/workflows/grav-plugin-release.yml@v1
+    permissions:
+      contents: write
+    with:
+      version: v9.9.9-selftest
+      draft: true
+      version_file: ''
+      changelog_file: ''
+      release_notes: 'Self test, delete me.'
