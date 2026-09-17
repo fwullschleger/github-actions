@@ -3,6 +3,11 @@ name: Self Test
 
 on:
   workflow_dispatch:
+    inputs:
+      version:
+        required: true
+        type: string
+        default: v9.9.9-selftest
 
 jobs:
   release:
@@ -10,7 +15,7 @@ jobs:
     permissions:
       contents: write
     with:
-      version: v9.9.9-selftest
+      version: ${{ inputs.version }}
       draft: true
       version_file: ''
       changelog_file: ''
