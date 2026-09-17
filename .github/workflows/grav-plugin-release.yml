@@ -1,0 +1,126 @@
+# Reusable release workflow for Grav plugins.
+#
+# A Grav plugin has no build step: the version lives in blueprints.yaml and the
+# GPM reads CHANGELOG.md, so "building" is a syntax check over the PHP sources.
+#
+# Call it from a plugin repository:
+#
+#   jobs:
+#     release:
+#       uses: fwullschleger/github-actions/.github/workflows/grav-plugin-release.yml@v1
+#       permissions:
+#         contents: write
+#       with:
+#         version: ${{ inputs.version }}
+
+name: Grav Plugin Release
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: 'SemVer version with leading v (e.g. v1.6.3)'
+        required: true
+        type: string
+      prerelease:
+        required: false
+        type: boolean
+        default: false
+      draft:
+        required: false
+        type: boolean
+        default: false
+      release_notes:
+        description: 'Optional text appended below the changelog entry'
+        required: false
+        type: string
+        default: ''
+      allow_older_version:
+        description: 'Bypass version order and history checks (hotfixes)'
+        required: false
+        type: boolean
+        default: false
+      version_file:
+        description: 'File holding the plugin version'
+        required: false
+        type: string
+        default: 'blueprints.yaml'
+      changelog_file:
+        description: 'Changelog to validate. Empty disables the check.'
+        required: false
+        type: string
+        default: 'CHANGELOG.md'
+      changelog_heading:
+        description: 'Heading the release entry must carry'
+        required: false
+        type: string
+        default: '# v{version_no_v}'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Required: the guard compares against every tag
+
+      - name: Run release guard
+        id: guard
+        uses: fwullschleger/github-actions/actions/release-guard@v1
+        with:
+          version: ${{ inputs.version }}
+          version_file: ${{ inputs.version_file }}
+          version_kind: yaml
+          changelog_file: ${{ inputs.changelog_file }}
+          changelog_heading: ${{ inputs.changelog_heading }}
+          allow_older_version: ${{ inputs.allow_older_version }}
+
+      - name: Lint PHP sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          php -v | head -n 1
+          echo "🧪 Checking PHP syntax..."
+          mapfile -t FILES < <(find . -name '*.php' -not -path './vendor/*' -not -path './.git/*')
+          if [[ ${#FILES[@]} -eq 0 ]]; then
+            echo "ℹ️  No PHP files found. Skipping."
+            exit 0
+          fi
+          for f in "${FILES[@]}"; do
+            php -l "$f" > /dev/null
+          done
+          echo "✅ ${#FILES[@]} PHP file(s) parse cleanly"
+
+      - name: Compose release notes
+        id: notes
+        shell: bash
+        env:
+          CHANGELOG_SECTION: ${{ steps.guard.outputs.changelog_section }}
+          RELEASE_NOTES: ${{ inputs.release_notes }}
+        run: |
+          set -euo pipefail
+          {
+            echo "body<<BODY_EOF"
+            if [[ -n "${CHANGELOG_SECTION//[[:space:]]/}" ]]; then
+              echo "$CHANGELOG_SECTION"
+            fi
+            if [[ -n "${RELEASE_NOTES//[[:space:]]/}" ]]; then
+              echo ""
+              echo "$RELEASE_NOTES"
+            fi
+            echo "BODY_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.version }}
+          name: ${{ inputs.version }}
+          body: ${{ steps.notes.outputs.body }}
+          draft: ${{ inputs.draft }}
+          prerelease: ${{ inputs.prerelease }}
+          target_commitish: ${{ github.sha }}

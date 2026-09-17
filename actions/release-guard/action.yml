@@ -1,0 +1,279 @@
+# release-guard — shared release gatekeeper for manual, tag-driven releases.
+#
+# This file is maintained in TWO independent copies. They are byte-identical by
+# intent; a change to one must be applied to the other:
+#
+#   sanetics/github-actions/actions/release-guard/action.yml       (private, .NET)
+#   fwullschleger/github-actions/actions/release-guard/action.yml  (public, Grav plugins)
+#
+# The two repositories never reference each other. Each ecosystem keeps its own
+# self-contained copy so neither account depends on the other.
+
+name: Release Guard
+description: >-
+  Validates a manual release request before anything is tagged: branch, SemVer
+  format, duplicate tags, version order, linear history, the version recorded in
+  the project file, and the changelog entry. Outputs the changelog section so a
+  release body does not have to be retyped.
+
+inputs:
+  version:
+    description: 'SemVer version to release, with leading v (e.g. v1.0.0, v1.0.0-beta1)'
+    required: true
+  version_file:
+    description: 'File holding the project version. Empty disables the consistency check.'
+    required: false
+    default: ''
+  version_kind:
+    description: 'How to read version_file: csproj | yaml | json | none'
+    required: false
+    default: 'none'
+  changelog_file:
+    description: 'Changelog to validate. Empty disables the changelog check.'
+    required: false
+    default: ''
+  changelog_heading:
+    description: >-
+      Heading that must exist for this release. Supports {version} (with v) and
+      {version_no_v}. Grav: "# v{version_no_v}". Keep a Changelog: "## [{version_no_v}]".
+    required: false
+    default: ''
+  allow_older_version:
+    description: 'Bypass the version order and linear history checks (hotfixes)'
+    required: false
+    default: 'false'
+
+outputs:
+  version_no_v:
+    description: 'The input version without its leading v'
+    value: ${{ steps.checks.outputs.version_no_v }}
+  changelog_section:
+    description: 'The changelog section for this version, empty when not checked'
+    value: ${{ steps.changelog.outputs.section }}
+
+runs:
+  using: composite
+  steps:
+    - name: 🛡️ Run safety checks
+      id: checks
+      shell: bash
+      env:
+        NEW_VERSION: ${{ inputs.version }}
+        ALLOW_OLDER: ${{ inputs.allow_older_version }}
+        VERSION_FILE: ${{ inputs.version_file }}
+        VERSION_KIND: ${{ inputs.version_kind }}
+        CURRENT_BRANCH: ${{ github.ref_name }}
+        PROTECTED_BRANCH: ${{ github.event.repository.default_branch }}
+        COMMIT_SHA: ${{ github.sha }}
+      run: |
+        set -euo pipefail
+
+        echo "════════════════════════════════════════════════════════"
+        echo "🔍 Starting safety checks for $NEW_VERSION"
+        echo "════════════════════════════════════════════════════════"
+        echo "ℹ️  Inputs:"
+        echo "   • Version: $NEW_VERSION"
+        echo "   • Allow older version: $ALLOW_OLDER"
+        echo "   • Version file: ${VERSION_FILE:-<none>} ($VERSION_KIND)"
+        echo "ℹ️  Environment:"
+        echo "   • Current branch: $CURRENT_BRANCH"
+        echo "   • Protected branch: $PROTECTED_BRANCH"
+        echo "   • Commit SHA: $COMMIT_SHA"
+        echo "════════════════════════════════════════════════════════"
+        echo ""
+
+        # 0. Shallow repository check -------------------------------------
+        echo "🔍 [Check 0/5] Verifying repository depth..."
+        SHALLOW_STATUS=$(git rev-parse --is-shallow-repository)
+        echo "   Repository shallow status: $SHALLOW_STATUS"
+        if [[ "$SHALLOW_STATUS" == "true" ]]; then
+          echo "::error::❌ Repository is shallow. The calling workflow must check out with fetch-depth: 0."
+          exit 1
+        fi
+        echo "✅ Repository has full history"
+        echo ""
+
+        # 1. Branch check --------------------------------------------------
+        echo "🔍 [Check 1/5] Validating release branch..."
+        echo "   Expected: $PROTECTED_BRANCH"
+        echo "   Current:  $CURRENT_BRANCH"
+        if [[ "$CURRENT_BRANCH" != "$PROTECTED_BRANCH" ]]; then
+          echo "::error::❌ Invalid branch. You can only release from '$PROTECTED_BRANCH'."
+          exit 1
+        fi
+        echo "✅ Branch check passed"
+        echo ""
+
+        # 2. Format check --------------------------------------------------
+        echo "🔍 [Check 2/5] Validating version format..."
+        echo "   Testing: $NEW_VERSION"
+        if [[ ! "$NEW_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.-]+)?$ ]]; then
+          echo "::error::❌ Invalid format. Example: v1.0.0 or v1.0.0-beta1"
+          exit 1
+        fi
+        VERSION_NO_V="${NEW_VERSION#v}"
+        echo "version_no_v=$VERSION_NO_V" >> "$GITHUB_OUTPUT"
+        echo "✅ Version format is valid"
+        echo ""
+
+        # 3. Duplicate check -----------------------------------------------
+        echo "🔍 [Check 3/5] Checking for duplicate tags..."
+        echo "   Checking local tags..."
+        if git rev-parse "$NEW_VERSION" >/dev/null 2>&1; then
+          echo "::error::❌ Tag '$NEW_VERSION' already exists (locally)."
+          exit 1
+        fi
+        echo "   ✓ Tag does not exist locally"
+        echo "   Checking remote tags..."
+        if git ls-remote --exit-code --tags origin "$NEW_VERSION" >/dev/null 2>&1; then
+          echo "::error::❌ Tag '$NEW_VERSION' already exists on remote."
+          exit 1
+        fi
+        echo "   ✓ Tag does not exist on remote"
+        echo "✅ No duplicate tags found"
+        echo ""
+
+        # 4. Version order and linear history ------------------------------
+        echo "🔍 [Check 4/5] Validating version history..."
+        ALL_TAGS=$(git tag --sort=-v:refname)
+        TAG_COUNT=$(echo "$ALL_TAGS" | grep -c . || true)
+        echo "   Total tags in repository: $TAG_COUNT"
+        if [[ "$TAG_COUNT" -gt 0 ]]; then
+          echo "   Recent tags:"
+          echo "$ALL_TAGS" | head -n 5 | sed 's/^/     - /'
+        fi
+        LATEST_TAG=$(echo "$ALL_TAGS" | head -n 1)
+
+        if [[ -z "$LATEST_TAG" ]]; then
+          echo "ℹ️  No previous tags found. Assuming this is the first release."
+        elif [[ "$ALLOW_OLDER" == "true" ]]; then
+          echo "   Latest existing tag: $LATEST_TAG"
+          echo "::warning::⚠️  'Allow older version' is ON. Bypassing order and history checks."
+        else
+          echo "   Latest existing tag: $LATEST_TAG"
+          echo "   New version: $NEW_VERSION"
+          echo ""
+          echo "   Testing version order..."
+          HIGHEST=$(printf '%s\n%s' "$LATEST_TAG" "$NEW_VERSION" | sort -V | tail -n 1)
+          echo "   Comparison result: $HIGHEST is the highest"
+          if [[ "$HIGHEST" == "$LATEST_TAG" ]]; then
+            echo "::error::❌ Invalid version order. $NEW_VERSION is not greater than existing $LATEST_TAG."
+            echo "👉 Tip: for a hotfix on an older line, enable 'Allow older version'."
+            exit 1
+          fi
+          echo "   ✓ $NEW_VERSION > $LATEST_TAG"
+          echo ""
+          echo "   Testing commit ancestry..."
+          LATEST_TAG_COMMIT=$(git rev-parse "$LATEST_TAG")
+          CURRENT_COMMIT=$(git rev-parse HEAD)
+          echo "   Latest tag ($LATEST_TAG) points to: ${LATEST_TAG_COMMIT:0:8}"
+          echo "   Current HEAD points to: ${CURRENT_COMMIT:0:8}"
+          if ! git merge-base --is-ancestor "$LATEST_TAG" HEAD; then
+            echo "::error::❌ Broken history. The current commit is not a descendant of $LATEST_TAG."
+            echo "👉 This ensures the release includes previous changes. Patching an old line? Enable 'Allow older version'."
+            exit 1
+          fi
+          echo "   ✓ Current commit is a descendant of $LATEST_TAG"
+          echo "✅ History is linear and the version is increasing"
+        fi
+        echo ""
+
+        # 5. Project version consistency -----------------------------------
+        echo "🔍 [Check 5/5] Validating the version recorded in the project..."
+        if [[ -z "$VERSION_FILE" || "$VERSION_KIND" == "none" ]]; then
+          echo "ℹ️  No version file configured. Skipping."
+        elif [[ ! -f "$VERSION_FILE" ]]; then
+          echo "::error::❌ Version file '$VERSION_FILE' not found."
+          exit 1
+        else
+          echo "   File: $VERSION_FILE ($VERSION_KIND)"
+          case "$VERSION_KIND" in
+            csproj)
+              PROJECT_VERSION=$(grep -oPm1 "(?<=<Version>)[^<]+" "$VERSION_FILE" 2>/dev/null \
+                || grep -oPm1 "(?<=<VersionPrefix>)[^<]+" "$VERSION_FILE" 2>/dev/null || true)
+              ;;
+            yaml)
+              PROJECT_VERSION=$(awk '/^version:/ { sub(/^version:[ \t]*/, ""); gsub(/["'"'"']/, ""); print; exit }' "$VERSION_FILE")
+              ;;
+            json)
+              PROJECT_VERSION=$(jq -r '.version // empty' "$VERSION_FILE")
+              ;;
+            *)
+              echo "::error::❌ Unknown version_kind '$VERSION_KIND'. Use csproj, yaml, json or none."
+              exit 1
+              ;;
+          esac
+          PROJECT_VERSION=$(echo "${PROJECT_VERSION:-}" | xargs)
+          if [[ -z "$PROJECT_VERSION" ]]; then
+            echo "::error::❌ No version found in $VERSION_FILE (kind: $VERSION_KIND)."
+            exit 1
+          fi
+          echo "   Project version: $PROJECT_VERSION"
+          echo "   Input version (stripped): $VERSION_NO_V"
+          if [[ "$PROJECT_VERSION" != "$VERSION_NO_V" ]]; then
+            echo "::error::❌ Mismatch. Input is $NEW_VERSION, but $VERSION_FILE says $PROJECT_VERSION."
+            echo "👉 Bump the version in $VERSION_FILE, commit, then release again."
+            exit 1
+          fi
+          echo "✅ Version in $VERSION_FILE matches the input"
+        fi
+        echo ""
+
+        echo "════════════════════════════════════════════════════════"
+        echo "✅ All safety checks passed!"
+        echo "════════════════════════════════════════════════════════"
+
+    - name: 📓 Validate and extract the changelog entry
+      id: changelog
+      shell: bash
+      env:
+        CHANGELOG_FILE: ${{ inputs.changelog_file }}
+        CHANGELOG_HEADING: ${{ inputs.changelog_heading }}
+        NEW_VERSION: ${{ inputs.version }}
+        VERSION_NO_V: ${{ steps.checks.outputs.version_no_v }}
+      run: |
+        set -euo pipefail
+
+        if [[ -z "$CHANGELOG_FILE" ]]; then
+          echo "ℹ️  No changelog configured. Skipping."
+          { echo "section<<CHANGELOG_EOF"; echo "CHANGELOG_EOF"; } >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        if [[ ! -f "$CHANGELOG_FILE" ]]; then
+          echo "::error::❌ Changelog '$CHANGELOG_FILE' not found."
+          exit 1
+        fi
+
+        if [[ -z "$CHANGELOG_HEADING" ]]; then
+          echo "::error::❌ changelog_file is set but changelog_heading is empty."
+          exit 1
+        fi
+
+        HEADING="${CHANGELOG_HEADING//\{version_no_v\}/$VERSION_NO_V}"
+        HEADING="${HEADING//\{version\}/$NEW_VERSION}"
+        echo "🔍 Looking for heading: $HEADING"
+
+        if ! grep -qxF "$HEADING" "$CHANGELOG_FILE"; then
+          echo "::error::❌ $CHANGELOG_FILE has no entry for this release."
+          echo "👉 Add a section headed exactly: $HEADING"
+          exit 1
+        fi
+
+        # The heading level decides where the section ends: a deeper heading is
+        # part of the entry (Grav puts the release date in one), the next
+        # heading at the same or a shallower level starts the previous release.
+        LEVEL=$(awk -v h="$HEADING" 'BEGIN { n = 0; while (substr(h, n + 1, 1) == "#") n++; print n }')
+
+        SECTION=$(awk -v h="$HEADING" -v lvl="$LEVEL" '
+          !seen && $0 == h { seen = 1; next }
+          seen && /^#/ {
+            n = 0; while (substr($0, n + 1, 1) == "#") n++;
+            if (n <= lvl) exit
+          }
+          seen { print }
+        ' "$CHANGELOG_FILE")
+
+        echo "✅ Changelog entry found"
+        echo "$SECTION"
+        { echo "section<<CHANGELOG_EOF"; echo "$SECTION"; echo "CHANGELOG_EOF"; } >> "$GITHUB_OUTPUT"
